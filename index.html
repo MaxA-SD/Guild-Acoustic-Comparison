@@ -7,12 +7,12 @@
 <style>
   :root {
     --bg: #f4f2ee; --card: #ffffff; --text: #1d1b18; --muted: #6f6a62;
-    --line: #dcd7cd; --accent: #b4532a; --accent-text: #ffffff; --active-bg: #f6e4d9;
+    --line: #dcd7cd; --accent: #b4532a; --accent-text: #ffffff; --btn-muted: #e6e2d9;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #151413; --card: #1f1d1b; --text: #ece8e1; --muted: #9a948a;
-      --line: #36322d; --accent: #e07a4a; --accent-text: #151413; --active-bg: #3a2519;
+      --line: #36322d; --accent: #e07a4a; --accent-text: #151413; --btn-muted: #2e2b27;
     }
   }
   * { box-sizing: border-box; }
@@ -42,19 +42,20 @@
     display: flex; align-items: center; gap: 12px; padding: 8px 10px;
     border: 1px solid var(--line); border-radius: 8px;
   }
-  li.active { background: var(--active-bg); border-color: var(--accent); }
-  li .play {
-    width: 40px; height: 40px; padding: 0; border-radius: 50%; flex: none;
-    background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-size: 1rem;
+  li .play, li .stop {
+    width: 40px; height: 40px; padding: 0; border-radius: 50%; flex: none; font-size: 1rem;
+    background: var(--btn-muted); border-color: var(--btn-muted); color: var(--muted);
   }
-  li .label { overflow-wrap: anywhere; }
+  li.active .play { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  li .stop { border-radius: 8px; }
+  li .label { overflow-wrap: anywhere; flex: 1; }
 </style>
 </head>
 <body>
 <main>
   <header>
     <h1>Guild Acoustic Comparison</h1>
-    <p class="sub">Click any play button to start. Click another during playback to switch instantly at the same position.</p>
+    <p class="sub">Click any play button to start. Click another during playback to switch instantly at the same position. Spacebar starts and stops.</p>
   </header>
   <div id="cats" style="display:contents"></div>
 </main>
@@ -65,23 +66,27 @@
 // "trim" is a per-file linear gain, reserved for a future level-matching feature.
 const CATEGORIES = {
   Strum: [
-    "Hifi DNA (Tone Down) - Strum",
     "Hifi DNA - Strum",
-    "Session VTC (Tone Down) - Strum",
+    "Hifi DNA (Tone Down) - Strum",
     "Session VTC - Strum",
+    "Session VTC (Tone Down) - Strum",
     "Wavelength - Strum",
-    "Wavelength Mic Full - Strum",
-    "Wavelength Mic Half - Strum"
+    "Wavelength Mic Half - Strum",
+    "Wavelength Mic Full - Strum"
   ],
   Fingerpick: [
-    "Hifi DNA (Tone Down) - Fingerpick",
     "Hifi DNA - Fingerpick",
-    "Session VTC (Tone Down) 0- Fingerpick",
+    "Hifi DNA (Tone Down) - Fingerpick",
     "Session VTC - Fingerpick",
+    "Session VTC (Tone Down) 0- Fingerpick",
     "Wavelength - Fingerpick",
-    "Wavelength Mic Full - Fingerpick",
-    "Wavelength Mic Half - Fingerpick"
+    "Wavelength Mic Half - Fingerpick",
+    "Wavelength Mic Full - Fingerpick"
   ]
+};
+// Display-label fixes only (the real filename on disk is unchanged).
+const LABEL_OVERRIDES = {
+  "Session VTC (Tone Down) 0- Fingerpick": "Session VTC (Tone Down) - Fingerpick"
 };
 const SWITCH_TC = 0.002;   // gain time constant (s) -> ~5-10 ms click-free crossfade
 
@@ -89,14 +94,15 @@ const SWITCH_TC = 0.002;   // gain time constant (s) -> ~5-10 ms click-free cros
 const ctx = new (window.AudioContext || window.webkitAudioContext)();
 const state = {};          // per category
 let activeCat = null;      // only one category plays at a time
+let last = { cat: Object.keys(CATEGORIES)[0], idx: 0 };   // what spacebar starts
 
 function buildUI() {
   const root = document.getElementById("cats");
   for (const [cat, names] of Object.entries(CATEGORIES)) {
     const s = state[cat] = {
-      name: cat, files: names.map(n => ({ name: n, buffer: null, trim: 1 })),
-      L: 0, loop: false, playing: false, active: null,
-      sources: [], gains: [], t0: 0, raf: 0, loaded: 0, els: {}
+      name: cat, files: names.map(n => ({ name: n, label: LABEL_OVERRIDES[n] || n, buffer: null, trim: 1, normGain: 1 })),
+      L: 0, loop: false, norm: false, playing: false, active: null,
+      sources: [], gains: [], trims: [], t0: 0, raf: 0, loaded: 0, els: {}
     };
     const sec = document.createElement("section");
     sec.innerHTML = `
@@ -104,7 +110,7 @@ function buildUI() {
         <h2>${cat}</h2>
         <div class="master">
           <button class="toggle" data-act="loop" aria-pressed="false">Loop</button>
-          <button data-act="stop" disabled>Stop</button>
+          <button class="toggle" data-act="norm" aria-pressed="false" title="Peak-normalize each file to 0 dBFS">Normalize</button>
         </div>
       </div>
       <p class="status">Loading…</p>
@@ -115,24 +121,39 @@ function buildUI() {
       const li = document.createElement("li");
       const btn = document.createElement("button");
       btn.className = "play"; btn.textContent = "▶"; btn.disabled = true;
-      btn.setAttribute("aria-label", "Play " + f.name);
+      btn.setAttribute("aria-label", "Play " + f.label);
       btn.onclick = () => play(cat, i);
       const lab = document.createElement("span");
-      lab.className = "label"; lab.textContent = f.name;
-      li.append(btn, lab); ul.append(li);
-      f.li = li; f.btn = btn;
+      lab.className = "label"; lab.textContent = f.label;
+      const stp = document.createElement("button");
+      stp.className = "stop"; stp.textContent = "■"; stp.disabled = true;
+      stp.setAttribute("aria-label", "Stop " + cat);
+      stp.onclick = () => stop(cat);
+      li.append(btn, stp, lab); ul.append(li);
+      f.li = li; f.btn = btn; f.stopBtn = stp;
     });
     s.els = {
       status: sec.querySelector(".status"),
       bar: sec.querySelector(".bar > div"),
-      stop: sec.querySelector('[data-act="stop"]'),
-      loop: sec.querySelector('[data-act="loop"]')
+      loop: sec.querySelector('[data-act="loop"]'),
+      norm: sec.querySelector('[data-act="norm"]')
     };
-    s.els.stop.onclick = () => stop(cat);
     s.els.loop.onclick = () => setLoop(cat, !s.loop);
+    s.els.norm.onclick = () => setNorm(cat, !s.norm);
     root.append(sec);
   }
 }
+
+function peakOf(buf) {
+  let peak = 0;
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < d.length; i++) { const a = d[i] < 0 ? -d[i] : d[i]; if (a > peak) peak = a; }
+  }
+  return peak;
+}
+
+function trimFor(s, f) { return f.trim * (s.norm ? f.normGain : 1); }
 
 async function loadCategory(cat) {
   const s = state[cat];
@@ -142,6 +163,7 @@ async function loadCategory(cat) {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`${res.status} for ${url}`);
       f.buffer = await ctx.decodeAudioData(await res.arrayBuffer());
+      f.normGain = 1 / (peakOf(f.buffer) || 1);   // gain that brings the file's peak to 0 dBFS
       s.els.status.textContent = `Loading… ${++s.loaded}/${s.files.length}`;
     }));
     // Shared length = shortest file, so every file wraps/ends together.
@@ -157,6 +179,7 @@ async function loadCategory(cat) {
 
 function play(cat, idx) {
   const s = state[cat];
+  last = { cat, idx };
   if (s.playing) {                         // already running: just switch
     if (s.active !== idx) switchTo(s, idx);
     return;
@@ -164,19 +187,18 @@ function play(cat, idx) {
   if (activeCat && activeCat !== cat) stop(activeCat);
   ctx.resume();
   const t0 = ctx.currentTime + 0.05;       // start all files on one shared clock
-  s.sources = []; s.gains = [];
+  s.sources = []; s.gains = []; s.trims = [];
   s.files.forEach((f, i) => {
     const src = ctx.createBufferSource();
     src.buffer = f.buffer;
     src.loop = s.loop; src.loopStart = 0; src.loopEnd = s.L;
-    const trim = ctx.createGain(); trim.gain.value = f.trim;
+    const trim = ctx.createGain(); trim.gain.value = trimFor(s, f);
     const g = ctx.createGain(); g.gain.value = i === idx ? 1 : 0;
     src.connect(trim).connect(g).connect(ctx.destination);
     src.start(t0, 0);
-    s.sources.push(src); s.gains.push(g);
+    s.sources.push(src); s.gains.push(g); s.trims.push(trim);
   });
   s.t0 = t0; s.playing = true; s.active = idx; activeCat = cat;
-  s.els.stop.disabled = false;
   refresh(s);
   s.raf = requestAnimationFrame(() => tick(s));
 }
@@ -195,10 +217,10 @@ function stop(cat) {
   cancelAnimationFrame(s.raf);
   s.sources.forEach(src => { try { src.stop(); } catch (_) {} src.disconnect(); });
   s.gains.forEach(g => g.disconnect());
-  s.sources = []; s.gains = [];
+  s.trims.forEach(t => t.disconnect());
+  s.sources = []; s.gains = []; s.trims = [];
   s.playing = false; s.active = null;
   if (activeCat === cat) activeCat = null;
-  s.els.stop.disabled = true;
   s.els.bar.style.width = "0%";
   refresh(s);
 }
@@ -214,6 +236,19 @@ function setLoop(cat, on) {
   s.els.loop.setAttribute("aria-pressed", String(on));
 }
 
+function setNorm(cat, on) {
+  const s = state[cat];
+  s.norm = on;
+  s.els.norm.setAttribute("aria-pressed", String(on));
+  if (s.playing) {
+    const now = ctx.currentTime;
+    s.trims.forEach((t, i) => {
+      t.gain.cancelScheduledValues(now);
+      t.gain.setTargetAtTime(trimFor(s, s.files[i]), now, 0.005);
+    });
+  }
+}
+
 function tick(s) {
   if (!s.playing) return;
   const elapsed = Math.max(0, ctx.currentTime - s.t0);
@@ -227,8 +262,20 @@ function refresh(s) {
   s.files.forEach((f, i) => {
     const on = s.playing && s.active === i;
     f.li.classList.toggle("active", on);
+    f.stopBtn.disabled = !s.playing;
   });
 }
+
+// Spacebar: stop whatever is playing, otherwise start the last-used file.
+function spaceHandler(e) {
+  if (e.code !== "Space") return;
+  e.preventDefault();                       // no page scroll / no re-click of a focused button
+  if (e.type !== "keydown" || e.repeat) return;
+  if (activeCat) stop(activeCat);
+  else if (state[last.cat].files[last.idx].buffer) play(last.cat, last.idx);
+}
+document.addEventListener("keydown", spaceHandler);
+document.addEventListener("keyup", spaceHandler);
 
 buildUI();
 Object.keys(CATEGORIES).forEach(loadCategory);
